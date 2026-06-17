@@ -10,7 +10,7 @@ provider "google" {
 #  Locals ( IMPORTANT)
 ######################################
 locals {
-  name_prefix = "agrichain-${var.env}"
+  name_prefix = "project-${var.env}"
 }
 
 ######################################
