@@ -1,0 +1,177 @@
+name: Terraform CI/CD (TEST ENV)
+
+on:
+  push:
+    branches-ignore:
+      - branch-name
+  pull_request:
+    branches-ignore:
+      - branch-name
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------
+      # Checkout
+      # -------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -------------------------------
+      # Setup Terraform
+      # -------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      # -------------------------------
+      # Set Variables
+      # -------------------------------
+      - name: Set variables
+        run: |
+          echo "ENV_NAME=test" >> $GITHUB_ENV
+          echo "TF_DIR=gcp/terraform-files/envs/test" >> $GITHUB_ENV
+          echo "TFVARS=test.tfvars" >> $GITHUB_ENV
+          echo "PROJECT_ID=project-name" >> $GITHUB_ENV
+          echo "VPC_NAME=vpc-name" >> $GITHUB_ENV
+          echo "GCP_SECRET=GCP_SA_KEY_TEST" >> $GITHUB_ENV
+
+      # -------------------------------
+      # Terraform Init
+      # -------------------------------
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -upgrade -input=false
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets[env.GCP_SECRET] }}
+
+      # -------------------------------
+      # Terraform Plan
+      # -------------------------------
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan \
+            -input=false \
+            -var-file="${{ env.TFVARS }}" \
+            -out=tfplan
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets[env.GCP_SECRET] }}
+
+      # =====================================================
+      # DESTROY FLOW
+      # =====================================================
+
+      # STEP 1: Destroy RDS
+      - name: Destroy RDS
+        if: github.event_name == 'push'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy \
+            -target=module.rds \
+            -auto-approve \
+            -input=false \
+            -var-file="${{ env.TFVARS }}" || true
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets[env.GCP_SECRET] }}
+
+      # STEP 2: Destroy GKE
+      - name: Destroy GKE
+        if: github.event_name == 'push'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy \
+            -target=module.gke_cluster \
+            -auto-approve \
+            -input=false \
+            -var-file="${{ env.TFVARS }}" || true
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets[env.GCP_SECRET] }}
+
+      # -------------------------------
+      # Wait for GCP backend cleanup
+      # -------------------------------
+      - name: Wait for GCP cleanup
+        if: github.event_name == 'push'
+        run: |
+          echo "Waiting 5 minutes for Service Networking cleanup..."
+          sleep 300
+
+      # =====================================================
+      # PSA CLEANUP (CRITICAL FIX)
+      # =====================================================
+      - name: Cleanup Service Networking (Robust)
+        if: github.event_name == 'push'
+        run: |
+          echo '${{ secrets[env.GCP_SECRET] }}' > key.json
+          gcloud auth activate-service-account --key-file=key.json
+          gcloud config set project $PROJECT_ID
+
+          echo "Starting Service Networking cleanup..."
+
+          for i in {1..10}; do
+            echo "Attempt $i"
+
+            PEERING=$(gcloud services vpc-peerings list \
+              --network=$VPC_NAME \
+              --format="value(peering)")
+
+            if [ -z "$PEERING" ]; then
+              echo "Peering already deleted"
+              break
+            fi
+
+            echo "Deleting peering..."
+            gcloud services vpc-peerings delete \
+              --service=servicenetworking.googleapis.com \
+              --network=$VPC_NAME || true
+
+            echo "Waiting before next retry..."
+            sleep 60
+          done
+
+          echo "Deleting reserved ranges..."
+
+          gcloud compute addresses list \
+            --global \
+            --filter="network=$VPC_NAME" \
+            --format="value(name)" | while read RANGE; do
+
+            if [ -n "$RANGE" ]; then
+              echo "Deleting range: $RANGE"
+              gcloud compute addresses delete "$RANGE" \
+                --global --quiet || true
+            fi
+
+          done
+
+      # =====================================================
+      # FINAL TERRAFORM DESTROY
+      # =====================================================
+      - name: Terraform Destroy (FINAL)
+        if: github.event_name == 'push'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy \
+            -auto-approve \
+            -input=false \
+            -var-file="${{ env.TFVARS }}" || true
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets[env.GCP_SECRET] }}
+
+      # -------------------------------
+      # Force delete VPC (last safety)
+      # -------------------------------
+      - name: Force Delete VPC
+        if: github.event_name == 'push'
+        run: |
+          echo '${{ secrets[env.GCP_SECRET] }}' > key.json
+          gcloud auth activate-service-account --key-file=key.json
+          gcloud config set project $PROJECT_ID
+
+          echo "Force deleting VPC..."
+          gcloud compute networks delete $VPC_NAME --quiet || true
